@@ -1,0 +1,302 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Quick pred plot
+```{r}
+quick_pred_plot <-  ## UPDATED FOR THE CLEANER OUTPUT NOW
+  function(df_out) {
+    # dplyr select filter 
+    # tidyr unnest pivot_longer unite
+    # ggplot2 ggplot aes, geom_line, scale_linetype_manual, scale_color_manual ....... 
+    
+  df_out %>%
+  dplyr::select(data, well, model_name)%>%
+  tidyr::unnest(cols = c(data)) %>%
+  tidyr::pivot_longer(-c(Temperature,  Temperature_norm, well, model_name), names_to = "which_value", values_to = "value") %>%
+  dplyr::filter(which_value %in% c("pred", "value_norm"))  %>%
+  tidyr::unite(variable,c(well, model_name, which_value), remove = FALSE) %>%
+  ggplot2::ggplot(aes(x = Temperature,
+             y = value,
+             color = which_value,
+             linetype = which_value,
+             group = rev(variable))) +
+  geom_line(alpha = 0.5) +
+  scale_linetype_manual(values = c("pred" = "solid", "value_norm" = "dashed")) +
+  scale_color_manual(values = c("pred" = "black", "value_norm" = "red"))
+  }
+```
+
+Read in fit results -- same as for notebook 5_find_best_models
+```{r}
+formulas <- read_rds("intermediate_objects/formulas_with_defaults.rds") # created in 3_...scratch
+by_variable <-read_rds("intermediate_objects/well_384_by_variable.rds")
+all_fits <- read_rds("intermediate_objects/well_384_all_fits_drop.rds")
+
+test_layout <- 
+  dsfworld::read_plate_layout("test_data/raw/Exp1086--20210217_OGT_OTL_TPR_L3Pra_repeat_DR_sr_layout.csv")
+
+test_fits <- all_fits %>% 
+  filter(well %in% c("A5", "A14","A10", "A20"))
+
+# take a look
+test_fits %>% 
+  unnest(cols = c(data)) %>%
+  filter(which_value %in% c("sigmoid_1", "sigmoid_2", "sigmoid_3"))
+
+# take a quick look at the test data
+# test_fits %>% quick_pred_plot() # from rmd 4_full_fitting_workflow
+```
+
+
+```{r}
+add_component_predictions <- 
+  function(tidied, data, 
+           temp_col = "Temperature",
+           rescale_temp_col = TRUE) {
+    # dplyr pull select group_by mutate bind_rows
+    # purrr map set_names
+    # tidyr nest unnest
+    # scales rescale
+    # rlang `!!` `:=`
+    
+    tryCatch({
+    temp_vec <- data %>% dplyr::pull({{ temp_col }})
+    
+    #### needs to be for temp norm
+    if(rescale_temp_col) { temp_vec <- scales::rescale(temp_vec, to = c(0,1))}
+
+    component_pred <- 
+      tidied %>%
+        dplyr::select(term, term_type, component_type, component, estimate) %>%
+        dplyr::group_by(component) %>%
+        tidyr::nest() %>%
+        dplyr::mutate(comp_pred = purrr::map(data, predict_component, x_vec = temp_vec)) %>%
+        dplyr::select(component, comp_pred) %>%
+        tidyr::unnest(cols = c(comp_pred)) %>%
+        purrr::set_names(c("which_value", temp_col, "value"))  %>%
+        dplyr::mutate(!!temp_col := data %>% pull({{ temp_col }})) # replacing again with non-norm temperature
+
+     out <- data %>% 
+       bind_rows(component_pred)
+    },
+    error = function(e){print("error on pred")
+      data},
+    warning = function(w){print("warning on pred")
+      data})
+  }
+
+extract_component_tma <-
+  function(data, 
+           component_names = c("sigmoid_1", "sigmoid_2", "sigmoid_3")) {
+    # dplyr filter group_by mutate ungroup select
+    # tidyr nest
+    # purrr map
+    # scales rescale
+
+    df <- data %>%
+      dplyr::filter(which_value %in% component_names) %>%
+      dplyr::group_by(which_value) %>%
+      tidyr::nest() %>%
+      dplyr::mutate(data = purrr::map(data, ~ dplyr::mutate(.x, 
+                                      value_norm = scales::rescale(value, to = c(0,1)),
+                                      drfu_norm = sgolay(value_norm, m = 1)
+                                      )),
+              tma = purrr::map(data, get_drfu_tma, .y_vec = "drfu_norm")[[1]])
+    
+    out <- df %>% 
+      dplyr::ungroup() %>%
+      dplyr::select(which_value, tma)
+  }
+```
+
+evaluate individual sigmoid components
+```{r}
+get_component_exprs <-
+  function(component_type) {
+     switch(component_type,
+             "sigmoid" = quote(Asym/(1 + exp((xmid - x_val)/scal)) * exp(d * (x_val - xmid))),
+             "initial" = quote(id_d * exp(x_val * id_b)))
+  }
+
+predict_component <-
+  function(df, 
+           eval_switch = dsfworld_components,
+           x_vec = seq(from = 0, to = 1, length = 70),
+           ... # currently does nothing, but good for passing extra external pars
+           ) {
+    
+    # tibble tibble
+    
+    component_type <- unique(df$component_type) 
+    to_eval <- get_component_exprs(component_type)
+    
+    par_list <- as.list(df$estimate)
+    names(par_list) <- df$term_type
+    par_list <- c(par_list,
+                  "x_val" = list(x_vec))
+
+    tibble::tibble(x = x_vec,
+           y = eval(to_eval, par_list))
+  }
+
+annotate_tidied_components <-
+  function(tidied) {
+    # dplyr mutate if_else
+    # readr parse_number
+    # tidyr unite
+    
+    tryCatch({
+      tidied %>% # the result of broom::tidy
+        dplyr::mutate(component_number = readr::parse_number(term),
+             term_type = gsub(pattern = "([0-9]+).*$", replacement = "", term),
+             component_type = if_else(term_type %in% c("id_d", "id_b"),
+                                      true = "initial",
+                                      false = "sigmoid")) %>%
+        tidyr::unite(component, c(component_type, component_number), sep = "_", remove = FALSE)
+    }, warning = function(w) {tidied},
+      error = function(e) {tidied})
+  }
+```
+
+Sort the output tmas
+```{r}
+sort_tmas <-
+  function(df, 
+           sort_type = "low_high", 
+           close_val = 0,
+           .tma_col = "tma") {
+    # dplyr group_by mutate min_rank arrange
+    # tidyr nest unnest
+    # purrr map
+    if(is.null(df)) { stop("Input dataframe is NULL")}
+    if(!is.numeric(close_val)) {
+      warning("`close_val` is not numeric. Coercing to numeric.")
+      close_val <- as.numeric(close_val)
+      if(is.na(close_val)) {warning("`close_val couldn't be converted to numeric. Coerced to 0")}
+    }
+    
+    .tma_col <- base::as.name(base::substitute(.tma_col))
+
+    close_val <-
+      switch(sort_type,
+             "low_high" = 0,
+             "closest_to" = close_val)
+    
+    df <- df %>%
+      dplyr::group_by(.var, model_name) %>%
+      tidyr::nest() %>%
+      dplyr::mutate(data = purrr::map(data, ~ 
+                                        dplyr::mutate(.x,
+                                                      rank =  try(dplyr::min_rank(abs({{ .tma_col }} - close_val)) )))) %>% 
+      tidyr::unnest(cols = c(data)) %>%
+      dplyr::arrange(.var, model_name, rank)
+  }
+```
+
+
+
+
+Example implementation and plotting
+```{r}
+test_fits_comp <- 
+  all_fits %>%
+  mutate(tidied = map(tidied, annotate_tidied_components)) %>%
+  #filter(well == "A5", model_name == "model_5") %>%
+  mutate(data = map2(tidied, data, add_component_predictions))
+
+model_tmas <- 
+  test_fits_comp %>%
+  mutate(model_tma = tryCatch(map(data, extract_component_tma), error = function(e) {NA}, warning = function(w) {NA})) %>%
+  select(well,model_name,  model_tma) %>%
+  unnest(cols = c(model_tma))
+
+write_rds("intermediate_objects/all_model_tmas.rds", x = model_tmas)
+
+p_all <- model_tmas %>%
+  left_join(test_layout, by = "well") %>%
+  # filter(protein != "Buffer",
+  #        !is.na(protein),
+  #        compound %in% c("TW408", "SYPRO")) %>%
+  unite(well_model, c(well, model_name), remove = FALSE) %>%
+  ggplot(aes(x = condition, #well_model, 
+             y = tma, 
+             color = model_name)) +
+  geom_point(alpha = 0.5, size = 1) +
+  coord_flip() +
+  scale_y_continuous(limits = c(25, 94)) +
+  labs(title = "Tmas from reconstructed models") +
+  theme(axis.text.y = element_text(size = 4)) +
+  facet_grid(cols = vars(model_name),
+             rows = vars(protein),
+             scales = "free",
+             space = "free")
+
+ggsave("results/4_full_fitting_workflow/model_tmas.pdf", p_all, height = 15, width = 10)
+```
+
+```{r}
+p_all <- model_tmas %>%
+  left_join(test_layout, by = "well") %>%
+  filter(protein != "Buffer",
+         !is.na(protein),
+         compound %in% c("TW408", "SYPRO")) %>%
+  unite(well_model, c(well, model_name), remove = FALSE) %>%
+  unite(variable, c(well_model, which_value), remove = FALSE) %>%
+  ggplot(aes(x = ligand_conc+0.1, #well_model, 
+             group = which_value,
+             y = tma, 
+             color = model_name)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_line()+
+  scale_y_continuous(limits = c(40, 75)) +
+  scale_x_continuous(trans = "log2") +
+  labs(title = "Tmas from reconstructed models") +
+  theme(axis.text.y = element_text(size = 8),
+        strip.text.y = element_text(angle = 0)) +
+  facet_grid(cols = vars(model_name),
+             rows = vars(protein, compound),
+             scales = "free",
+             space = "free")
+
+ggsave("results/4_full_fitting_workflow/model_tmas_trimmed.pdf", p_all, height =6, width = 10)
+ model_tmas
+```
+
+
+```{r}
+for_preds <- 
+  test_fits %>%
+  filter(well == "A5",
+         model_name == "model_3") %>%
+  .$tidied %>%
+  .[[1]] %>%
+   mutate(component_number = parse_number(term),
+         term_type = gsub(pattern = "([0-9]+).*$", replacement = "", term),
+         component_type = if_else(term_type %in% c("id_d", "id_b"),
+                                  true = "initial",
+                                  false = "sigmoid")) %>%
+  unite(component, c(component_type, component_number), sep = "_", remove = FALSE)
+
+for_preds %>%
+  select(term, term_type, component_type, component, estimate) %>%
+  group_by(component) %>%
+  nest() %>%
+  mutate(comp_pred = map(data, predict_component)) %>%
+  unnest(cols = c(comp_pred)) %>%
+  ggplot(aes(x = x, 
+             y = y, 
+             group = component)) +
+  geom_line()
+
+for_preds
+  
+```
+
+
+

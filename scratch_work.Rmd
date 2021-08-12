@@ -1,0 +1,463 @@
+---
+title: "Working on functions before placing in a source script"
+output: html_notebook
+---
+This does not include model compostion! 
+It is meant to be the shortest path to functionality
+necessary packages
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(minpack.lm)
+library(modelr)
+```
+
+Aspirational function so we can better change how errors are handled
+```{r}
+handle_errors <-
+  function(expr, 
+           warning_fun,
+           error_func) {
+    tryCatch(expr,
+             warning_func = function(w) {warning_func},
+             error_func = function(e) {error_func})
+  }
+```
+
+------- Copied from 2_get_start_pars notebook -------
+A formals()-based approach for data-dependent defaults on savistky-golay filtering
+These will be updated upon data uploading / loading
+IN UTILS
+```{r}
+# signal sgoaly 
+
+# This is the funamdental sgolay code, with default values
+sgolay <- function(x, p, n, m) signal::sgolayfilt(x, p = 5, n = 13, m)
+
+# here, we set new defaults based on the user's data
+formals(sgolay) <- alist(x = , # user supplies data
+                    p = win3d, # this is calculated from the data
+                    n = calc_span, # this is calculated from the data
+                    m = ) # user chooses filter order 
+
+# sgolay(value, 1) # this should return the first derivative of the value vector
+
+###------ example of setting the sgolay filt formals
+p_order <- 2
+calc_span <- 15
+
+# here, we set new defaults based on the user's data
+formals(sgolay) <- alist(x = , # user supplies data
+                    p = p_order, # this is calculated from the data
+                    n = calc_span, # this is calculated from the data
+                    m = ) # user chooses filter order 
+###------ example of setting the formals
+
+abort_bad_argument <- function(arg, must, not = NULL) {
+  msg <- glue::glue("`{arg}` must {must}")
+  if (!is.null(not)) {
+    msg <- glue::glue("{msg}; not `{not}`.")
+  }
+
+  rlang::abort("error_bad_argument",
+               message = msg,
+               arg = arg,
+               must = must,
+               not = not
+  )
+}
+```
+
+in condition
+```{r}
+condition_raw <-
+  function(df, 
+           unique_col = "well",
+           value_col = "value",
+           temp_col = "Temperature",
+           keep_cols = c("well", "Temperature", "value", "value_norm")) {
+    # handle either quoted or symbol inputs
+    unique_col <- as.name(substitute(unique_col))
+    value_col <- as.name(substitute(value_col))
+    temp_col <- as.name(substitute(temp_col))
+    
+    col_nm <- c(rlang::as_string(unique_col),
+                rlang::as_string(value_col),
+                rlang::as_string(temp_col))
+                
+    #_____Check input column names____
+    if (!all( col_nm %in% names(df))) { # ensure user columns present in df
+      abort_bad_argument("supplied column names not present in dataframe. All columns",
+                         must = glue::glue("be in dataframe names: {glue::glue_collapse(names(df), sep = ', ')}"),
+                         not = NULL ) }
+    
+    #_____Set sgolay filter formals____
+    .sgolay_formal_p_order <- 2
+    .sgolay_formal_calc_span <- 15
+    
+    # all columns are of correct type
+    df %>%
+      dplyr::select(tidyselect::all_of(col_nm)) %>%
+      dplyr::rename(.var = {{ unique_col }},
+                     value = {{ value_col}},
+                     Temperature = {{ temp_col}}) %>%
+      dplyr::group_by(.var) %>%
+      dplyr::mutate(value_norm = scales::rescale(value, to = c(0, 1)),
+                    Temperature_norm = scales::rescale(Temperature, to = c(0, 1)),
+                    drfu_norm = signal::sgolayfilt(value_norm, p = 5, n = 13, m = 1)) %>% # could (should?) use dyanmic formals eventually?
+      tidyr::nest()
+  }
+```
+
+
+IN GET_ESTIMATES.R
+```{r}
+###### ---- given drfu data, estimates major and minor transitions, and returns them ordered by their magnitude
+estimate_transitions <- 
+  function( values, 
+            norm_raw_y,
+            norm_raw_x,
+            transition = "major",
+            min_peak_height = 0.0002,
+            min_valley_height = 0.000001,
+            low_temp_margin = 5,
+            high_temp_margin = 95) {
+    
+    # stats loess predict
+    # quantmod findPeaks findValleys
+    # secondary dependency: signal sgolayfilt (from sgolay function)
+    # tibble tibble
+    # dplyr arrange desc mutate
+  
+  # smooth the input vector ### is this really necessary?
+  norm_length <- c(1:length(values))/length(values)
+  interp <- stats::loess( values ~ norm_length, span = 0.1) %>%  stats::predict()
+  
+  if (transition == "major") {
+    points <- interp %>% quantmod::findPeaks()
+    
+  } else if (transition == "minor") {
+    dval <- values %>% sgolay(m = 1)
+    interp <- loess( dval ~ norm_length, span = 0.1) %>%  predict()
+     
+    points <- interp %>% abs() %>% quantmod::findValleys() 
+    
+  } else if (transition == "initial") {
+    
+    init_mean <- norm_raw_y[c(1:3)] %>% mean() 
+    
+    out <- 
+    tibble::tibble(est_row = 1,
+           val_at_est =  init_mean,
+           est_val = init_mean,
+           est_raw_x = norm_raw_x[1],
+           est_raw_y = norm_raw_y[1],
+           est_type = transition) %>%
+    dplyr::arrange(dplyr::desc(val_at_est)) %>%
+    dplyr::mutate(est_rank = c(1:nrow(.)))
+    
+    return(out) ###### RETURNS HERE
+    
+  } else {
+    print("Invalid transition type requested; returning major transition")
+    points <- interp %>% quantmod::findPeaks()
+  }
+  
+  # correct for indexing
+  points <- points - 1
+  
+  # return peaks, removing ones which fall outside the legitimate tma range
+  points[points > low_temp_margin | points > high_temp_margin]
+  
+  out <- 
+    tibble::tibble(est_row = points,
+           val_at_est =  values[points], # the value from drfu
+           est_val = norm_raw_x[points], # the value passed to par
+           est_raw_x = norm_raw_x[points],
+           est_raw_y = norm_raw_y[points],
+           est_type = transition) %>%
+    dplyr::arrange(dplyr::desc(val_at_est)) %>%
+    dplyr::mutate(est_rank = c(1:nrow(.)))
+}
+
+
+add_estimates <-
+  function(df,
+           .est_peak_col = drfu_norm, 
+           .est_init_col = value_norm,
+           .norm_raw_x = Temperature_norm,
+           .norm_raw_y = value_norm) {
+  ##### how to we handle places where this fails?? 
+  # probably in "estimate_transitions" function--correct?
+  
+  # dplyr bind_rows
+   out <- 
+     lapply(X = c("major", "minor", "initial"), # all three transtion types
+        FUN = function(.x) { 
+          estimate_transitions(values = df %>% pull({{ .est_peak_col }}),
+                                norm_raw_x = df %>% pull({{ .norm_raw_x }}),
+                                norm_raw_y = df %>% pull({{ .norm_raw_y }}),
+                                transition = .x) 
+            }) %>%
+      dplyr::bind_rows()
+}
+
+```
+
+Format estimations for the fit, add default values
+ALSO IN GET_ESTIMATES.R, but i'm not sure this is the right place for it
+```{r}
+pars_from_estimates <- #__translate estimates df to pars list for nlsLM
+  function(estimates, # df with all estimate information
+           which_pars, # all parameters desired
+           pars_defaults = list(Asym1 = 1, xmid1 = 0.4, scal1 = 0.03, d1 = -0.5, 
+                                Asym2 = 0.5,  xmid2 = 0.6, scal2 = 0.03,  d2 = -1, 
+                                Asym3 = 0.3, xmid3 = 0.2, scal3 = 0.03, d3 = -1.5,
+                                id_d1 = 0.2, id_b1 = -5), # not everything gets an estimate
+           par_order = c("Asym1", "xmid1", "scal1", "d1", # par order must match final formula
+                         "Asym2", "xmid2", "scal2", "d2",
+                         "Asym3", "xmid3", "scal3", "d3",
+                         "id_d1", "id_b1")) {
+
+  ##### work to do on this function ########
+  # intelligent estimate of Asym from data?
+  # improved ordering of xmid values -- when to use minor or major transtions?
+
+    # dplyr mutate if_else filter bind_rows arrange
+    # tidyr unite
+    # tibble tibble
+    # purrr as_vector
+    
+ ## match estimates to par names
+ par_df <- # keep as intermediate - useful for additional intelligent ordering
+     estimates %>%
+     # match parameter names to forumula
+      dplyr::mutate(par_type = 
+               dplyr::if_else(est_type %in% c("minor", "major"), 
+                       true = "xmid", 
+                       false = "id_d")) %>%
+     tidyr::unite(par_name, c(par_type, est_rank), 
+              sep = "", remove = FALSE) %>%
+     
+    # drop pars irrelevant or redundant to given formula
+     dplyr::filter(est_type != "minor",  ### CURRENTLY IGNORES MINOR TRANSITIONS!!!!!!
+                    par_name %in% which_pars) 
+ 
+ ## create the final parameter list
+  defaults <-
+      tibble::tibble(par_name = names(pars_defaults),
+             est_val =  pars_defaults %>% purrr::as_vector()) %>%
+        dplyr::filter(par_name %in% which_pars, # drop pars not in the model
+               ! par_name %in% par_df$par_name) # drop pars supplied by estimates
+
+ #-----PARAMETER LIST ORDER HAS TO MATCH FORMULA -----#
+  df <- # combine estimated and default pars
+    dplyr::bind_rows(par_df, defaults) %>%
+    dplyr::mutate(par_f = factor(par_name, levels = par_order)) %>%
+    dplyr::arrange(par_f) 
+  
+  #### HERE -- ADD A CHECK TO REPLACE THE ESTIMATES WITH THE DEFAULTS IF THEY ARE WHACKY ###
+  
+  ## nlsLM expects a list
+  out <- as.list(df$est_val)
+  names(out) <- df$par_name
+  out # can be fed directly to nlsLM as start pars
+  
+  }
+```
+
+```{r}
+fit_to_model <- # an updated version of compose_dsf_model, with a better name
+  function(df,
+           start_pars,
+           formula, 
+           lower_bound,
+           control_list = list(maxiter = 500)) {
+
+    # minpack.lm nlsLM
+            tryCatch(
+
+              minpack.lm::nlsLM(formula,
+                    data = df,
+                    start = start_pars,
+                    lower = lower_bound,
+                    control = control_list),
+
+              warning = function(w) return(NA), error = function(e) return(NA)
+
+            )
+  }
+
+fit_all <- 
+  function(by_variable,
+           which_pars, # formulas$model_2$pars %>% names())[1]
+           formula, # formulas$model_2$formula
+           lower_bound, # manual_pars$m2_low
+           drop_raw = TRUE,
+           temperature_col = c("Temperature"),
+           keep_data_cols = c("resid", "pred"),
+           ...
+           ) {
+    
+    # dplyr filter
+    # purrr map map2
+    # broom tidy glance augment
+    # modelr add_residuals add_predictions
+ out <- 
+  by_variable %>%
+   ### ultimately, I think we could / should add starting parameter estimates to this function
+  dplyr::mutate(est = map(data, add_estimates),
+                pars = tryCatch( # translate estimates to start pars
+                    purrr::map(est, 
+                    pars_from_estimates, 
+                    which_pars = which_pars)[1], 
+                    warning = function(w) return(NA), error = function(e) return(NA)),
+               model = tryCatch( # fit to the given formula
+                          purrr::map2(data, 
+                            pars, 
+                            fit_to_model, 
+                            formula = formula, 
+                            lower_bound = lower_bound),
+                          warning = function(w) return(NA), error = function(e) return(NA)),
+               # model qualities and predictions
+                tidied  = tryCatch(purrr::map(model, broom::tidy), warning = function(w) return(NA), error = function(e) return(NA)), # extract model parameters
+                glanced = tryCatch(purrr::map(model, broom::glance), warning = function(w) return(NA), error = function(e) return(NA)),
+                data    = tryCatch(purrr::map2(data, model, modelr::add_residuals), warning = function(w) return(data), error = function(e) return(data)), # add the residuals
+                data    = tryCatch(purrr::map2(data, model, modelr::add_predictions), warning = function(w) return(data), error = function(e) return(data)) # model is the column we created earlier, not the actual model itself
+         ) 
+ 
+ if( drop_raw ) {
+     out <- out %>%
+       mutate(data = tryCatch(map(data, ~ select(.x, any_of(c(temperature_col, keep_data_cols)))), warning = function(w) return(data), error = function(e) return(data))) 
+ }
+###### give this a more informative error message or when the model didn't converge
+#        Error : Problem with `mutate()` column `data`.
+# ℹ `data = map(data, ~select(.x, any_of(keep_data_cols)))`.
+# x no applicable method for 'select' applied to an object of class "NULL"
+# ℹ The error occurred in group 100: well = "E12".
+
+ # pivot longer -- is cleaner in the downstream handling steps    
+ out <- out %>%
+    mutate(data  = tryCatch(map(data, pivot_longer, 
+                                       cols = any_of(keep_data_cols), 
+                                       names_to = "which_value", 
+                                       values_to = "value"),
+                            warning = function(w) return(data), 
+                            error = function(e) return(data)
+                            )
+    )
+ 
+  }
+```
+
+Glance at fitting results to see how things look
+```{r}
+quick_pred_plot <- 
+  function(df_out) {
+    # dplyr select filter 
+    # tidyr unnest pivot_longer unite
+    # ggplot2 ggplot aes, geom_line, scale_linetype_manual, scale_color_manual ....... 
+    
+  df_out %>%
+  dplyr::select(preds, .var, model_name)%>%
+  tidyr::unnest(cols = c(preds)) %>%
+  tidyr::pivot_longer(-c(Temperature, Temperature_norm, .var, model_name), names_to = "which_value", values_to = "value") %>%
+  dplyr::filter(which_value %in% c("pred", "value_norm"))  %>%
+  tidyr::unite(variable,c(.var, model_name, which_value), remove = FALSE) %>%
+  ggplot2::ggplot(aes(x = Temperature,
+             y = value,
+             color = which_value,
+             linetype = which_value,
+             group = rev(variable))) +
+  geom_line(alpha = 0.5) +
+  scale_linetype_manual(values = c("pred" = "solid", "value_norm" = "dashed")) +
+  scale_color_manual(values = c("pred" = "black", "value_norm" = "red"))
+  }
+```
+
+```{r}
+get_drfu_tma <- 
+  function(data,
+           .x_vec = "Temperature", # is Temperature
+           .y_vec = "drfu_norm", # is drfu
+           .precision = 0.1) {
+    
+    # handle either quoted or symbol inputs
+    .x_vec <- as.name(substitute(.x_vec))
+    .y_vec <- as.name(substitute(.y_vec))
+    
+       col_nm <- c(rlang::as_string(.x_vec),
+                rlang::as_string(.y_vec))
+    
+    #_____Check input column names____
+    if (!all( col_nm %in% names(data))) { # ensure user columns present in df
+      abort_bad_argument("supplied column names not present in dataframe. All columns",
+                         must = glue::glue("be in dataframe names: {glue::glue_collapse(names(data), sep = ', ')}"),
+                         not = NULL ) }
+       
+  
+    df <- 
+      tibble::tibble(x =  data[[.x_vec]],
+             y = data[[.y_vec]])
+
+    grid <-
+      tibble::tibble( x = seq(min(df$x), max(df$x), by = .precision)) %>%
+      modelr::add_predictions(loess(y ~ x, data = df, span = .precision))
+    
+    tma <- grid$x[which(grid$pred == max(grid$pred))][[1]] # 1 is incase there are ~equal maxes
+    
+  }
+```
+
+```{r}
+get_model_tma <-
+  function(by_var,
+           which_models, # options c("model_1", "model_2", "model_3", "model_4", "model_5", "model_6")
+           #dsfworld_formulas, # should we make this an argument? unsure how to pass formulas to this function
+           dsfworld_models = TRUE,
+           model_pars = NULL,
+           model_formula = NULL,
+           model_lower_bound = NULL,
+           ...) {
+
+    dsfworld_model_names <- c("model_1", "model_2", "model_3", "model_4", "model_5", "model_6")
+    
+    if( which_models == "all") { which_models <- dsfworld_model_names }
+    # model names are unique
+    if(! length(which_models) == length(unique(which_models))) {
+     warning("model names supplied to `which_models` are not all unique. \n Fitting each model name only once.")
+     which_models <- unique(which_models) }
+    
+    # if dsfworld models, names can be found
+    if(dsfworld_models == TRUE) {
+      if(is.null(formulas)) {
+        stop("dsfworld models selected, but `formulas` object cannot be found. Please defines `formulas` object in the global workspace.")
+          }
+      
+      if(! all(which_models %in% dsfworld_model_names)) {
+       stop(glue::glue("Supplied model names not in dsfworld models. \n dsfworld model names are: {glue::glue_collapse(dsfworld_model_names, sep = ', ')}"))
+      }
+    }
+
+    # if user-supplied models, all input are legit
+     if(dsfworld_models == FALSE) {
+       if (any(is.null(model_pars),
+              is.null(model_formula),
+              is.null(model_lower_bound))) {
+           stop("`dsfworld_models` set to FALSE, but user-supplied model aruguments `model_pars`, `model_formula`, `model_lower_bound` are missing.")
+              }
+     }
+
+    out <-
+      which_models %>%
+      lapply( . ,function(x) {
+             fit_all(by_var,
+                        formulas[[x]]$pars %>% names(),
+                        formulas[[x]]$formula,
+                        formulas[[x]]$lower_bound) %>%
+          mutate(model_name = x) %>%
+          dplyr::relocate(.var, model_name)}
+        ) %>%
+       dplyr::bind_rows()
+  }
+```

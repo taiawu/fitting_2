@@ -1,0 +1,139 @@
+---
+title: "Workflow for the scrpt"
+output: html_notebook
+---
+executive decisions
+nested dataframe is called 
+
+have user define the unique column at the beginning, and then name that column something else
+checks: that there is only one measurement per degree in the unique name
+that the unique name chosen (.var) is actually unique
+```{r}
+library(tidyverse)
+source("R/condition_raw.R")
+source("R/drfu_tmas.R")
+source("R/fit_models.R")
+source("R/get_estimates.R")
+source("R/utils.R")
+source("R/predict_components.R")
+source("R/extract_component_tmas.R")
+```
+
+--------- Example of using the functions -------
+Read in objects
+```{r}
+# starting parameter data created in 2_get_start_pars
+raw_data <- readRDS("data/test_raw_384.rds") %>%
+  unnest(cols = c(data)) %>%
+  select(-c(value_norm, Temperature_norm)) # full nested data
+
+formulas <- read_rds("data/formulas_with_defaults.rds") # created in 3_...scratch
+```
+
+Condition the raw data
+```{r}
+by_var <- condition_raw(raw_data) 
+# test: has correct columns
+# test: columns are correct type
+# test: measurements are unique per group per temperature
+# that temperatures are reasonable? (e.g. what if someone mixes up temperatures and value in the input)
+
+# by_var %>% unnest(cols = c(data))
+```
+
+calculate drfu tmas
+```{r}
+by_var <-
+  by_var %>%
+  mutate(drfu_tma = map(data, get_drfu_tma)[[1]])
+
+# by_var
+```
+
+```{r}
+with_model_tmas <- 
+  by_var %>%
+  get_model_tma("all")
+
+# the condition has length > 1 and only the first element will be used -- appeared once, from where?
+# add a check to make sure that the formula object exists in the workspace
+
+# with_model_tmas # printing this makes the console / RStudio laggy i think?
+# write_rds("with_model_tmas_output.rds", x = with_model_tmas) 
+```
+
+```{r}
+# with_model_tmas <- read_rds("with_model_tmas_output.rds")
+
+comp_tmas <-
+  with_model_tmas %>%
+  # filter(.var %in% c("A5", "A15")) %>%
+  add_component_preds() %>%
+  add_component_tmas() %>%
+  sort_tmas("closest_to", close_val = 45)
+
+```
+```{r}
+comp_tmas %>%
+  ggplot(aes(x = .var, #well_model, 
+             y = tma, 
+             color = rank)) +
+  geom_point(alpha = 0.5, size = 1) +
+  coord_flip() +
+  scale_y_continuous(limits = c(25, 94)) +
+  labs(title = "Tmas from reconstructed models") +
+  scale_color_viridis_c()+
+  theme_void() +
+  facet_wrap(~model_name)
+```
+
+
+
+```{r}
+test_fits_comp <- 
+  with_model_tmas %>%
+  mutate(tidied = map(tidied, annotate_tidied_components)) %>%
+  #filter(well == "A5", model_name == "model_5") %>%
+  mutate(data = map2(tidied, data, add_component_predictions))
+
+ # write_rds("test_fits_comp_output.rds", x = test_fits_comp) 
+test_fits_comp <- read_rds("test_fits_comp_output.rds")
+
+model_tmas <- 
+  test_fits_comp %>%
+  mutate(model_tma = tryCatch(map(data, extract_component_tma), error = function(e) {NA}, warning = function(w) {NA})) %>%
+  select(.var, model_name,  model_tma) %>%
+  unnest(cols = c(model_tma))
+
+ordered_tmas <- model_tmas %>%
+  sort_tmas( . , "low_high", .tma_col = "tma")
+
+ordered_tmas
+```
+
+```{r}
+p_all <- model_tmas %>%
+  left_join(test_layout, by = "well") %>%
+  # filter(protein != "Buffer",
+  #        !is.na(protein),
+  #        compound %in% c("TW408", "SYPRO")) %>%
+  unite(well_model, c(well, model_name), remove = FALSE) %>%
+  ggplot(aes(x = condition, #well_model, 
+             y = tma, 
+             color = model_name)) +
+  geom_point(alpha = 0.5, size = 1) +
+  coord_flip() +
+  scale_y_continuous(limits = c(25, 94)) +
+  labs(title = "Tmas from reconstructed models") +
+  theme(axis.text.y = element_text(size = 4)) +
+  facet_grid(cols = vars(model_name),
+             rows = vars(protein),
+             scales = "free",
+             space = "free")
+
+ggsave("results/4_full_fitting_workflow/model_tmas.pdf", p_all, height = 15, width = 10)
+```
+
+
+
+
